@@ -37,9 +37,9 @@ gv_lockfile=""              # lock file
 #-------------------------------------------------------------------------------
 # Default configuration
 #-------------------------------------------------------------------------------
-# DB-specific values are specified in the configuration file: ${CONFIG_FILE}
-# Configuration string format: db_name.cfg.parameter=value - set parameter to value
-#                              db_name.env.parameter=value - set and export
+# DB-specific values are set in the configuration file: ${CONFIG_FILE}
+# Configuration string format: db_name.cfg.parameter=value - configuration parameters
+#                              db_name.env.parameter=value - environment variables
 #-------------------------------------------------------------------------------
 rman_device_type="SBT_TAPE"         # RMAN device type (SBT_TAPE|DISK)
 rman_env_string=""                  # RMAN environment string (mandatory for SBT_TAPE backups)
@@ -51,7 +51,7 @@ rman_compressed="no"                # Compress RMAN backups
 rman_keepdays=""                    # RMAN keep until time in days
 rman_tag=""                         # Custom RMAN tag
 rman_arch_keep_hrs=0                # How long archivelogs should be retained after being backed up
-maillist="xxx@example.com"          # Comma separated list of email recipients
+maillist="anton.sokirkin@lenta.com" # Comma separated list of email recipients
 
 #-------------------------------------------------------------------------------
 # Print script usage
