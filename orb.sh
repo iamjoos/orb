@@ -51,7 +51,7 @@ rman_compressed="no"                # Compress RMAN backups
 rman_keepdays=""                    # RMAN keep until time in days
 rman_tag=""                         # Custom RMAN tag
 rman_arch_keep_hrs=0                # How long archivelogs should be retained after being backed up
-maillist="anton.sokirkin@lenta.com" # Comma separated list of email recipients
+maillist="xxx@example.com" # Comma separated list of email recipients
 
 #-------------------------------------------------------------------------------
 # Print script usage
