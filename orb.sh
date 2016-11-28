@@ -9,7 +9,7 @@
 #            | Filter out RMAN-08120 (attempt to delete archivelog not applied to standby)
 #            | Added global backup log (ORB_LOG_FILE)
 # 28/11/2016 | Added "DELETE INPUT" for arch backups when rman_arch_keep_hrs=0
-#			 |  (see func. do_rman_al_delete)
+#            |  (see func. do_rman_al_delete)
 #            | Added enabling of FORCE_LOGGING prior to backup
 ################################################################################
 #-------------------------------------------------------------------------------
