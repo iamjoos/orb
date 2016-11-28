@@ -8,6 +8,9 @@
 # 08/11/2016 | Configure archivelog deletion policy if the database has standby
 #            | Filter out RMAN-08120 (attempt to delete archivelog not applied to standby)
 #            | Added global backup log (ORB_LOG_FILE)
+# 28/11/2016 | Added "DELETE INPUT" for arch backups when rman_arch_keep_hrs=0
+#			 |  (see func. do_rman_al_delete)
+#            | Added enabling of FORCE_LOGGING prior to backup
 ################################################################################
 #-------------------------------------------------------------------------------
 # CONSTANTS
@@ -33,6 +36,7 @@ gv_rman_tag=""              # RMAN backup tag format
 gv_rman_start=""            # RMAN start time
 gv_rman_end=""              # RMAN end time
 gv_lockfile=""              # lock file
+gv_force_logging=""			# force logging flag
 
 #-------------------------------------------------------------------------------
 # Default configuration
@@ -51,7 +55,7 @@ rman_compressed="no"                # Compress RMAN backups
 rman_keepdays=""                    # RMAN keep until time in days
 rman_tag=""                         # Custom RMAN tag
 rman_arch_keep_hrs=0                # How long archivelogs should be retained after being backed up
-maillist="xxx@example.com" # Comma separated list of email recipients
+maillist="admin@example.com"        # Comma separated list of email recipients
 
 #-------------------------------------------------------------------------------
 # Print script usage
@@ -105,6 +109,9 @@ prn() {
 	case ${l_msgtype} in
 	err)
 		printf "%s\n" "ERROR: ${l_msgtext}" >&2
+		;;
+	inf)
+		printf "%s\n" "INFO: ${l_msgtext}"
 		;;
 	dbg)
 		do_chk_opt_flag debug && printf "%s\n" "DEBUG: ${l_msgtext}"
@@ -317,7 +324,9 @@ do_sql_cmd() {
 	exit
 	" | "${ORACLE_HOME}"/bin/sqlplus -s / as sysdba
 
-	return $?
+	[[ $? != 0 ]] && prn fatal "SQL*Plus returned an error. Exiting."
+	
+	return 0
 }
 
 #-------------------------------------------------------------------------------
@@ -540,6 +549,26 @@ do_rman_compress() {
 }
 
 #-------------------------------------------------------------------------------
+# RMAN archivelogs removal
+# Globals:
+#	rman_arch_keep_hrs
+# Parameters:
+#	none
+#-------------------------------------------------------------------------------
+do_rman_al_delete() {
+	if [[ ${rman_arch_keep_hrs} == 0 ]] ; then
+		echo "DELETE INPUT"
+	else
+		echo ";"
+		echo "   DELETE NOPROMPT ARCHIVELOG ALL"
+		echo "       BACKED UP 1 TIMES TO DEVICE TYPE '${rman_device_type}'"
+		echo "       COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24'"
+	fi
+	
+	return 0
+}
+
+#-------------------------------------------------------------------------------
 # Generate RMAN command file
 # Globals:
 #	gv_db_name
@@ -556,7 +585,7 @@ do_rman_compress() {
 do_gen_rman_cmd() {
 	gv_rman_cmd_file="/tmp/${gv_db_name}_${gv_backup_type}.rman"
 	cat /dev/null > ${gv_rman_cmd_file}
-
+	
 	rmn "CONNECT TARGET /;"
 	rmn "CONFIGURE RETENTION POLICY TO $(do_rman_retention);"
 	rmn "CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE ${rman_device_type} TO '$(do_rman_cf_format)';"
@@ -564,7 +593,7 @@ do_gen_rman_cmd() {
 	do_check_stb_db && rmn "CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;"
 	rmn "RUN {"
 	do_allocate_rman_channels
-		
+
 	case ${gv_backup_type} in
 	archdel)
 		rmn "   CROSSCHECK ARCHIVELOG ALL;"
@@ -581,10 +610,8 @@ do_gen_rman_cmd() {
 		rmn "       FILESPERSET 20"
 		[[ -n ${rman_keepdays} ]] && \
 		rmn "       KEEP UNTIL TIME 'SYSDATE+${rman_keepdays}'"
-		rmn "       ARCHIVELOG ALL NOT BACKED UP 1 TIMES;"
-		rmn "   DELETE NOPROMPT ARCHIVELOG ALL"
-		rmn "       BACKED UP 1 TIMES TO DEVICE TYPE '${rman_device_type}'"
-		rmn "       COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
+		rmn "       ARCHIVELOG ALL NOT BACKED UP 1 TIMES"
+		rmn "       $(do_rman_al_delete);"
 		;;
 	lvl0|lvl1)
 		local l_level=${gv_backup_type/lvl} # level number (0 or 1)
@@ -592,7 +619,8 @@ do_gen_rman_cmd() {
 		gv_rman_format="%d_df_lvl${l_level}_%s_%p_%t_%T"
 		gv_rman_tag="LVL${l_level}_$(date +%d%m%Y_%H%M)"
 
-		rmn "   BACKUP $(do_rman_compress) INCREMENTAL LEVEL ${l_level}"
+		rmn "   BACKUP $(do_rman_compress)"
+		rmn "       INCREMENTAL LEVEL ${l_level}"
 		rmn "       FORMAT '$(do_rman_format)'"
 		rmn "       TAG '$(do_rman_tag)'"
 		rmn "       FILESPERSET 1"
@@ -610,10 +638,8 @@ do_gen_rman_cmd() {
 			rmn "       FORMAT '$(do_rman_format)'"
 			rmn "       TAG '$(do_rman_tag)'"
 			rmn "       FILESPERSET 20"
-			rmn "       ARCHIVELOG ALL NOT BACKED UP 1 TIMES;"
-			rmn "   DELETE NOPROMPT ARCHIVELOG ALL"
-			rmn "       BACKED UP 1 TIMES TO DEVICE TYPE '${rman_device_type}'"
-			rmn "       COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
+			rmn "       ARCHIVELOG ALL NOT BACKED UP 1 TIMES"
+			rmn "       $(do_rman_al_delete);"
 		fi
 		
 		rmn "   DELETE NOPROMPT OBSOLETE;"
@@ -759,6 +785,47 @@ do_header() {
 }
 
 #-------------------------------------------------------------------------------
+# Enable/disable force logging
+# Globals:
+#	gv_force_logging
+# Parameters:
+#	1 - enable/disable command
+#-------------------------------------------------------------------------------
+do_force_logging_ctl() {
+	local l_cmd="$1"
+	local l_fl=""
+	
+	case ${l_cmd} in
+	enable)
+		gv_force_logging=$(do_sql_cmd "select force_logging from v\$database")
+		if [[ ${gv_force_logging} == "NO" ]] ; then
+			prn inf "Enabling FORCE_LOGGING to make sure the backup is recoverable"
+			do_sql_cmd "alter database force logging"
+			# double check force logging was enabled
+			l_fl=$(do_sql_cmd "select force_logging from v\$database")
+			[[ ${l_fl} != "YES" ]] && prn fatal "Something went wrong while enabling force logging. Exiting."
+		fi
+		;;
+	disable)
+		# disable it only if it was enabled by the script
+		if [[ ${gv_force_logging} == "NO" ]] ; then
+			prn inf "Disabling FORCE_LOGGING"
+			do_sql_cmd "alter database no force logging"
+			# double check force logging was disabled
+			l_fl=$(do_sql_cmd "select force_logging from v\$database")
+			[[ ${l_fl} != "NO" ]] && prn fatal "Something went wrong while disabling force logging. Exiting."
+		fi
+		;;
+	*)
+		prn err "Unknown command: ${l_cmd}"
+		exit 1
+		;;
+	esac
+	
+	return 0
+}
+
+#-------------------------------------------------------------------------------
 # Parse command line arguments
 # Globals:
 #	gv_db_name
@@ -790,7 +857,7 @@ do_parse_args() {
 			# when needed, flags are checked with do_chk_opt_flag
 			gv_opt_flags="${l_arg} ${gv_opt_flags}"
 			;;
-		help)
+		help|-h)
 			usage
 			;;
 		*)
@@ -844,7 +911,9 @@ main() {
 	do_create_dirs
 	do_header
 	do_gen_rman_cmd
+	do_force_logging_ctl enable
 	do_exec_rman
+	do_force_logging_ctl disable
 	do_send_log
 	do_cleanup
 }
