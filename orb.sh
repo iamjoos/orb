@@ -13,6 +13,8 @@
 #            | Added enabling of FORCE_LOGGING prior to backup
 # 30/11/2016 | Renamed functions, combined parse_* and validate_* functions
 #            | Improved logging
+# 26/12/2016 | Debugging improvements
+#            | Reworked sql function
 ################################################################################
 # set -x
 #-------------------------------------------------------------------------------
@@ -41,6 +43,7 @@ g_rman_tag=""             # RMAN backup tag format
 g_rman_start=""           # RMAN start time
 g_rman_end=""             # RMAN end time
 g_force_logging=""        # force logging flag
+g_sql_result=""           # SQL*Plus output
 
 #-------------------------------------------------------------------------------
 # Default configuration
@@ -122,6 +125,9 @@ prn() {
       ;;
     fatal)
       printf "%s\n" "[FATAL] ${l_msgtext}" >&2
+      for l_recipient in ${maillist}; do
+        echo "Backup script failed. Please check script output." | mailx -s "FATAL: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" ${l_recipient}
+      done
       cleanup
       exit 1
       ;;
@@ -170,6 +176,13 @@ parse_cfg() {
   # to avoid issues when the vars are exported before running the script
   unset ORACLE_HOME ORACLE_SID
   # Grep lines formatted as "db_name.", remove matching pattern, and source the rest of the line
+  if check_flag debug; then
+    prn dbg "----------------------------- DB CFG START -----------------------------"
+    for l_cfg in $(grep -oP "^${g_db_name}.\K.+" "${CONFIG_FILE}"); do
+      prn dbg "${l_cfg}"
+    done
+    prn dbg "----------------------------- DB CFG END -------------------------------"
+  fi
   . <(grep -oP "^${g_db_name}.\K.+" "${CONFIG_FILE}")
   
   # Validations:
@@ -227,12 +240,17 @@ init_log_file() {
 
 #-------------------------------------------------------------------------------
 # Run an SQL command
+# Function passes results through the global var g_sql_result instead of subshell \
+#   to be able to fail on SQL errors. Also, this allows to print debug messages.
 # Parameters:
 #  1 - SQL command
 #-------------------------------------------------------------------------------
 sql() {
   local l_cmd="${1}"
-
+  local l_sqlplus_rc
+  
+  prn dbg "SQL command: ${l_cmd}"
+  g_sql_result=$(
   echo "
   whenever oserror  exit 1
   whenever sqlerror exit sql.sqlcode
@@ -240,9 +258,14 @@ sql() {
   ${l_cmd};
   exit
   " | "${ORACLE_HOME}"/bin/sqlplus -s / as sysdba
+  )
+  l_sqlplus_rc="$?"
 
-  [[ $? != 0 ]] && prn fatal "SQL*Plus returned an error. Exiting."
-  
+  prn dbg "SQL result: ${g_sql_result}"
+  if [[ ${l_sqlplus_rc} != 0 ]]; then
+    prn fatal "SQL*Plus returned an error. Exiting."
+  fi
+
   return 0
 }
 
@@ -252,8 +275,9 @@ sql() {
 #  none
 #-------------------------------------------------------------------------------
 check_db_status() {
-  g_inst_status=$(sql "select status from v\$instance")
-
+  sql "select status from v\$instance"
+  g_inst_status=${g_sql_result}
+  
   case ${g_inst_status} in
     OPEN|MOUNTED)
       ;;
@@ -271,7 +295,8 @@ check_db_status() {
 #  none
 #-------------------------------------------------------------------------------
 check_db_role() {
-  g_db_role=$(sql "select database_role from v\$database")
+  sql "select database_role from v\$database"
+  g_db_role=${g_sql_result}
 
   case ${g_db_role} in
     PRIMARY)
@@ -301,7 +326,10 @@ check_db_role() {
 #-------------------------------------------------------------------------------
 has_standby() {
   local l_stb_num
-  l_stb_num=$(sql "select count(*) from v\$archive_dest where target='STANDBY'")
+
+  sql "select count(*) from v\$archive_dest where target='STANDBY'"
+  l_stb_num=${g_sql_result}
+  
   if [[ $((l_stb_num)) == 0 ]]; then
     return 1
   else
@@ -377,7 +405,8 @@ rman_tag() {
 
   # add "_E{expiration_date}" to the tag if keep option specified
   if [[ -n ${rman_keepdays} ]]; then
-    l_keepuntil=$( sql "select to_char(sysdate+${rman_keepdays},'DDMMYYYY') from dual" )
+    sql "select to_char(sysdate+${rman_keepdays},'DDMMYYYY') from dual"
+    l_keepuntil="${g_sql_result}"
     l_tag="${l_tag}_E${l_keepuntil}"
   fi
 
@@ -461,7 +490,8 @@ rman_al_delete() {
 gen_rman_cmd() {
   g_rman_cmd_file="/tmp/${g_db_name}_${g_backup_type}.rman"
   cat /dev/null > ${g_rman_cmd_file}
-  
+
+  prn dbg "----------------------------- RMAN CMD BEGIN ---------------------------"  
   rmn "CONNECT TARGET /;"
   rmn "CONFIGURE RETENTION POLICY TO $(rman_retention);"
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE ${rman_device_type} TO '$(rman_cf_format)';"
@@ -539,7 +569,8 @@ gen_rman_cmd() {
   rmn "LIST EXPIRED BACKUP;"
   rmn "LIST EXPIRED ARCHIVELOG ALL;"
   rmn "EXIT;"
-
+  prn dbg "----------------------------- RMAN CMD END -----------------------------"
+  
   return 0
 }
 #-------------------------------------------------------------------------------
@@ -554,16 +585,10 @@ exec_rman() {
     return 0
   fi
 
-  if check_flag debug; then
-    prn dbg "Content of ${g_rman_cmd_file}:"
-    prn "--------------------------------------------------------------------------------"
-    cat "${g_rman_cmd_file}"
-    prn "--------------------------------------------------------------------------------"
-  fi
-  
-  local l_etime=$(date +%s) # uid for this backup session in the global log
+  local l_etime # uid for this backup session in the global log
+  l_etime=$(date +%s) 
   g_rman_start=$(date +%Y-%m-%d\ %H:%M:%S)
-  echo "${g_rman_start} ${g_db_name}:${g_backup_type}:${l_etime}:START" >> ${ORB_LOG_FILE}
+  echo "${g_rman_start} ${g_db_name}:${g_backup_type}:${l_etime}:START" >> "${ORB_LOG_FILE}"
   
   prn inf "RMAN started at: ${g_rman_start}"
   prn dbg "${ORACLE_HOME}/bin/rman cmdfile=${g_rman_cmd_file} log=${g_rman_log_file}"
@@ -579,10 +604,10 @@ exec_rman() {
 
   g_rman_end=$(date +%Y-%m-%d\ %H:%M:%S)
   
-  prn inf "RMAN ended at: $g_rman_end}"
+  prn inf "RMAN ended at: ${g_rman_end}"
   prn inf "Backup status: ${g_backup_status}"
   
-  echo "${g_rman_end} ${g_db_name}:${g_backup_type}:${l_etime}:${g_backup_status}" >> ${ORB_LOG_FILE}
+  echo "${g_rman_end} ${g_db_name}:${g_backup_type}:${l_etime}:${g_backup_status}" >> "${ORB_LOG_FILE}"
   
   # Add RMAN log to the log file
   cat "${g_rman_log_file}" >> "${g_log_file}" && rm "${g_rman_log_file}"
@@ -602,7 +627,7 @@ send_log() {
   check_flag dryrun && return 0
   
   for l_recipient in ${maillist}; do
-    cat "${g_log_file}" | mailx -s "${g_backup_status}: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" ${l_recipient}
+    mailx -s "${g_backup_status}: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" ${l_recipient} < "${g_log_file}"
   done
 
   prn inf "Email sent to ${maillist}"
@@ -616,6 +641,8 @@ send_log() {
 #-------------------------------------------------------------------------------
 rmn() {
   echo "${1}" >> ${g_rman_cmd_file}
+  prn dbg "${1}"
+
   return 0
 }
 
@@ -629,23 +656,21 @@ log_header() {
   
   mv "${g_log_file}" "${g_log_file}.tmp"
   
-  (
-  prn "################################################################################"
-  prn "ORACLE_SID      : ${ORACLE_SID}"
-  prn "ORACLE_HOME     : ${ORACLE_HOME}"
-  prn "Hostname        : $(hostname)"
-  prn "Backup type     : ${g_backup_type}"
+  prn log "################################################################################"
+  prn log "ORACLE_SID      : ${ORACLE_SID}"
+  prn log "ORACLE_HOME     : ${ORACLE_HOME}"
+  prn log "Hostname        : $(hostname)"
+  prn log "Backup type     : ${g_backup_type}"
   [[ ${rman_device_type} == "DISK" ]] && \
-  prn "Backup dest     : ${rman_backup_dest}"
-  prn "Database role   : ${g_db_role}"
-  prn "Instance status : ${g_inst_status}"
+  prn log "Backup dest     : ${rman_backup_dest}"
+  prn log "Database role   : ${g_db_role}"
+  prn log "Instance status : ${g_inst_status}"
   [[ -n "${g_opt_flags}" ]] && \
-  prn "Additional flags: ${g_opt_flags}"
-  prn "RMAN log file   : ${g_log_file}"
-  prn "Start time      : ${g_rman_start}"
-  prn "End time        : ${g_rman_end}"
-  prn "################################################################################"
-  ) > "${g_log_file}"
+  prn log "Additional flags: ${g_opt_flags}"
+  prn log "RMAN log file   : ${g_log_file}"
+  prn log "Start time      : ${g_rman_start}"
+  prn log "End time        : ${g_rman_end}"
+  prn log "################################################################################"
   
   cat "${g_log_file}.tmp" >> "${g_log_file}" && rm "${g_log_file}.tmp"
   
@@ -765,10 +790,16 @@ check_flag() {
 #  none
 #-------------------------------------------------------------------------------
 cleanup() {
-  prn dbg "Removing ${g_lock_file}"
-  [[ -f "${g_lock_file}" ]] && rm "${g_lock_file}"
-  prn dbg "Removing ${g_rman_cmd_file}"
-  [[ -f "${g_rman_cmd_file}" ]] && rm "${g_rman_cmd_file}"
+  if [[ -f "${g_lock_file}" ]]; then
+    prn dbg "Removing ${g_lock_file}"
+    rm "${g_lock_file}"
+  fi
+  
+  if [[ -f "${g_rman_cmd_file}" ]]; then
+    prn dbg "Removing ${g_rman_cmd_file}"
+    rm "${g_rman_cmd_file}"
+  fi
+  
   return 0
 }
 
