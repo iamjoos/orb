@@ -28,22 +28,22 @@ ORB_LOG_FILE="${PROGDIR}/orb.log" # Global log file, stores info about all backu
 #-------------------------------------------------------------------------------
 # GLOBAL VARIABLES
 #-------------------------------------------------------------------------------
-g_db_name=""              # database name
-g_backup_type=""          # backup type
-g_inst_status=""          # instance status
-g_db_role=""              # database role
-g_opt_flags=""            # additional options passed to the script
-g_log_file=""             # log file
-g_rman_log_file=""        # RMAN log file
-g_lock_file=""            # lock file
-g_rman_cmd_file=""        # RMAN command file
-g_backup_status="FAILED"  # backup status
-g_rman_format=""          # RMAN backup name format
-g_rman_tag=""             # RMAN backup tag format
-g_rman_start=""           # RMAN start time
-g_rman_end=""             # RMAN end time
-g_force_logging=""        # force logging flag
-g_sql_result=""           # SQL*Plus output
+g_db_name=""                  # database name
+g_backup_type=""              # backup type
+g_inst_status=""              # instance status
+g_db_role=""                  # database role
+g_opt_flags=""                # additional options passed to the script
+g_log_file=""                 # log file
+g_rman_log_file=""            # RMAN log file
+g_lock_file=""                # lock file
+g_rman_cmd_file=""            # RMAN command file
+g_backup_status="NOT_STARTED" # backup status
+g_rman_format=""              # RMAN backup name format
+g_rman_tag=""                 # RMAN backup tag format
+g_rman_start=""               # RMAN start time
+g_rman_end=""                 # RMAN end time
+g_force_logging=""            # force logging flag
+g_sql_result=""               # SQL*Plus output
 
 #-------------------------------------------------------------------------------
 # Default configuration
@@ -125,9 +125,7 @@ prn() {
       ;;
     fatal)
       printf "%s\n" "[FATAL] ${l_msgtext}" >&2
-      for l_recipient in ${maillist}; do
-        echo "Backup script failed. Please check script output." | mailx -s "FATAL: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" ${l_recipient}
-      done
+      echo "${l_msgtext}" | mailx -s "FATAL: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" "${maillist}"
       cleanup
       exit 1
       ;;
@@ -600,6 +598,8 @@ exec_rman() {
     # Check RMAN log file for warnings
     # RMAN-08120 is an exception (attempt to delete archivelogs not applied to standby)
     egrep "RMAN-|ORA-" "${g_rman_log_file}" | egrep -v "RMAN-08120" >/dev/null 2>&1 && g_backup_status="WARNING"
+  else
+    g_backup_status="FAILED"
   fi
 
   g_rman_end=$(date +%Y-%m-%d\ %H:%M:%S)
@@ -611,7 +611,7 @@ exec_rman() {
   
   # Add RMAN log to the log file
   cat "${g_rman_log_file}" >> "${g_log_file}" && rm "${g_rman_log_file}"
-  prn inf "RMAN log file merged into ${g_log_file}"
+  prn inf "Backup log file: ${g_log_file}"
   return 0
 }
 
@@ -621,14 +621,11 @@ exec_rman() {
 #  none
 #-------------------------------------------------------------------------------
 send_log() {
-  local l_recipient
-
   check_flag nomail && return 0
   check_flag dryrun && return 0
   
-  for l_recipient in ${maillist}; do
-    mailx -s "${g_backup_status}: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" ${l_recipient} < "${g_log_file}"
-  done
+  prn dbg "mailx -s \"${g_backup_status}: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)\" ${l_recipient} < \"${g_log_file}\""
+  mailx -s "${g_backup_status}: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" "${maillist}" < "${g_log_file}"
 
   prn inf "Email sent to ${maillist}"
   return 0
@@ -689,12 +686,14 @@ force_logging() {
   
   case ${l_cmd} in
   enable)
-    g_force_logging=$(sql "select force_logging from v\$database")
+    sql "select force_logging from v\$database"
+    g_force_logging="${g_sql_result}"
     if [[ ${g_force_logging} == "NO" ]]; then
       prn inf "Enabling FORCE_LOGGING to make sure the backup is recoverable"
       sql "alter database force logging"
       # double check force logging was enabled
-      l_fl=$(sql "select force_logging from v\$database")
+      sql "select force_logging from v\$database"
+      l_fl="${g_sql_result}"
       [[ ${l_fl} != "YES" ]] && prn fatal "Something went wrong while enabling force logging. Exiting."
     fi
     ;;
@@ -704,7 +703,8 @@ force_logging() {
       prn inf "Disabling FORCE_LOGGING"
       sql "alter database no force logging"
       # double check force logging was disabled
-      l_fl=$(sql "select force_logging from v\$database")
+      sql "select force_logging from v\$database"
+      l_fl="${g_sql_result}"
       [[ ${l_fl} != "NO" ]] && prn fatal "Something went wrong while disabling force logging. Exiting."
     fi
     ;;
