@@ -15,6 +15,14 @@
 #            | Improved logging
 # 26/12/2016 | Debugging improvements
 #            | Reworked sql function
+# 31/01/2017 | Moved "DELETE OBSOLETE" right after DF backup instead of AL backup
+#            | because otherwise automatic CF backup taken after DF backup for databases with retention=1
+#            | was removed and it caused issues with duplicate
+# 11/05/2017 | Bugfixes
+#            | Removed unnecessary cleanup calls
+#            | New RMAN error filter
+#            | rman_arch_copies parameter
+#            | Rolled back changes to rman_al_delete added on 28/11/2016
 ################################################################################
 # set -x
 #-------------------------------------------------------------------------------
@@ -24,6 +32,11 @@ PROGNAME="$(basename "$0")"
 PROGDIR="$(readlink -f "$(dirname "$0")")"
 CONFIG_FILE="${PROGDIR}/orb.conf"
 ORB_LOG_FILE="${PROGDIR}/orb.log" # Global log file, stores info about all backups
+# Errors to filter out:
+#  RMAN-08120 - archived log not deleted, not yet applied by standby
+#  RMAN-08137 - archived log not deleted, needed for standby or upstream capture process
+#  RMAN-08138 - archived log not deleted - must create more backups
+RMAN_ERR_FILTER="RMAN-08120|RMAN-08137|RMAN-08138"
 
 #-------------------------------------------------------------------------------
 # GLOBAL VARIABLES
@@ -45,6 +58,7 @@ g_rman_end=""                 # RMAN end time
 g_force_logging=""            # force logging flag
 g_sql_result=""               # SQL*Plus output
 
+
 #-------------------------------------------------------------------------------
 # Default configuration
 #-------------------------------------------------------------------------------
@@ -61,6 +75,7 @@ rman_compressed="no"            # Compress RMAN backups
 rman_keepdays=""                # RMAN keep until time in days
 rman_tag=""                     # Custom RMAN tag
 rman_arch_keep_hrs=0            # How long archivelogs should be retained after being backed up
+rman_arch_copies=1              # How many archivelog copies should be kept
 maillist="root@$(hostname -s)"  # Comma separated list of email recipients
 
 #-------------------------------------------------------------------------------
@@ -79,7 +94,7 @@ usage() {
   echo "  options:"
   echo "    nomail    - Do not send email notifications"
   echo "    debug     - Show debug information"
-  echo "    stb_only  - Perform backup only if the current database role is PHYSICAL_STANDBY"
+  echo "    stb_only  - Perform backup only if the current database role is PHYSICAL STANDBY"
   echo "    prm_only  - Perform backup only if the current database role is PRIMARY"
   echo "    dryrun    - Do not execute RMAN commands"
 
@@ -126,7 +141,6 @@ prn() {
     fatal)
       printf "%s\n" "[FATAL] ${l_msgtext}" >&2
       echo "${l_msgtext}" | mailx -s "FATAL: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" "${maillist}"
-      cleanup
       exit 1
       ;;
     *)
@@ -185,12 +199,13 @@ parse_cfg() {
   
   # Validations:
   case ${rman_device_type} in
+    # archdel shouldn't require any DISK/TAPE configurations, others should
     SBT_TAPE)
-      [[ -z ${rman_env_string} ]] && \
+      [[ -z ${rman_env_string}  && ${g_backup_type} != "archdel" ]] && \
         prn fatal "Tape backups require rman_env_string to be set."
       ;;
     DISK)
-      [[ -z ${rman_backup_dest} ]] && \
+      [[ -z ${rman_backup_dest} && ${g_backup_type} != "archdel" ]] && \
         prn fatal "Backup destination (rman_backup_dest) must be set."
       mkdir -p ${rman_backup_dest} 2>/dev/null || \
         prn fatal "Unable to create backup directory: ${rman_backup_dest}"
@@ -230,7 +245,7 @@ setenv() {
 #-------------------------------------------------------------------------------
 init_log_file() {
   g_log_file="${PROGDIR}/logs/${g_db_name}/${g_db_name}_${g_backup_type}_$(date +%Y-%m-%d_%H%M%S).log"
-  g_rman_log_file="${PROGDIR}/logs/${g_db_name}/${g_db_name}_${g_backup_type}_$(date +%Y-%m-%d_%H%M%S).rman"
+  g_rman_log_file="${PROGDIR}/logs/${g_db_name}/${g_db_name}_${g_backup_type}_$(date +%Y-%m-%d_%H%M%S).tmp"
   mkdir -p "${PROGDIR}/logs/${g_db_name}" 2>/dev/null || \
     prn fatal "Unable to create logs direcotry ${PROGDIR}/logs/${g_db_name}."
   return 0
@@ -300,14 +315,12 @@ check_db_role() {
     PRIMARY)
       if check_flag stb_only; then
         prn "Option stb_only specified, exiting."
-        cleanup
         exit 0
       fi
       ;;
-    PHYSICAL_STANDBY)
+    "PHYSICAL STANDBY")
       if check_flag prm_only; then
         prn "Option prm_only specified, exiting"
-        cleanup
         exit 0
       fi
       ;;
@@ -317,23 +330,6 @@ check_db_role() {
   return 0
 }
 
-#-------------------------------------------------------------------------------
-# Check if the database has a standby destination
-# Parameters:
-#  none
-#-------------------------------------------------------------------------------
-has_standby() {
-  local l_stb_num
-
-  sql "select count(*) from v\$archive_dest where target='STANDBY'"
-  l_stb_num=${g_sql_result}
-  
-  if [[ $((l_stb_num)) == 0 ]]; then
-    return 1
-  else
-    return 0
-  fi
-}
 
 #-------------------------------------------------------------------------------
 # Allocate RMAN channels
@@ -463,24 +459,6 @@ rman_compress() {
 }
 
 #-------------------------------------------------------------------------------
-# RMAN archivelogs removal
-# Parameters:
-#  none
-#-------------------------------------------------------------------------------
-rman_al_delete() {
-  if [[ ${rman_arch_keep_hrs} == 0 ]]; then
-    echo "DELETE INPUT"
-  else
-    echo ";"
-    echo "   DELETE NOPROMPT ARCHIVELOG ALL"
-    echo "     BACKED UP 1 TIMES TO DEVICE TYPE '${rman_device_type}'"
-    echo "     COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24'"
-  fi
-  
-  return 0
-}
-
-#-------------------------------------------------------------------------------
 # Generate RMAN command file
 # Parameters:
 #  none
@@ -489,24 +467,29 @@ gen_rman_cmd() {
   g_rman_cmd_file="/tmp/${g_db_name}_${g_backup_type}.rman"
   cat /dev/null > ${g_rman_cmd_file}
 
+  # check if the database has standby
+  sql "select count(*) from v\$archive_dest where target='STANDBY'"
+  local l_stb_cnt="${g_sql_result}"
+  
   prn dbg "----------------------------- RMAN CMD BEGIN ---------------------------"  
   rmn "CONNECT TARGET /;"
-  rmn "CONFIGURE RETENTION POLICY TO $(rman_retention);"
+  [[ ${g_db_role} == "PRIMARY" ]] && rmn "CONFIGURE RETENTION POLICY TO $(rman_retention);" # doesn't work on standby
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE ${rman_device_type} TO '$(rman_cf_format)';"
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP ON;"
-  has_standby && rmn "CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;"
+  (( ${l_stb_cnt} )) && rmn "CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;"
   rmn "RUN {"
-  rman_allocate_channels
 
   case ${g_backup_type} in
   archdel)
-    rmn "   CROSSCHECK ARCHIVELOG ALL;"
-    rmn "   DELETE NOPROMPT ARCHIVELOG ALL;"
+    # rmn "   CROSSCHECK ARCHIVELOG ALL;"
+    rmn "   DELETE NOPROMPT ARCHIVELOG ALL"
+    rmn "     COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
     ;;
   arch)
     g_rman_format="%d_al_%s_%p_%t_%T"
     g_rman_tag="AL_$(date +%d%m%Y_%H%M)"
     
+    rman_allocate_channels
     rmn "   SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';"
     rmn "   BACKUP $(rman_compress)"
     rmn "     FORMAT '$(rman_format)'"
@@ -514,8 +497,10 @@ gen_rman_cmd() {
     rmn "     FILESPERSET 20"
     [[ -n ${rman_keepdays} ]] && \
     rmn "     KEEP UNTIL TIME 'SYSDATE+${rman_keepdays}'"
-    rmn "     ARCHIVELOG ALL NOT BACKED UP 1 TIMES"
-    rmn "     $(rman_al_delete);"
+    rmn "     ARCHIVELOG ALL NOT BACKED UP ${rman_arch_copies} TIMES;"
+    rmn "   DELETE NOPROMPT ARCHIVELOG ALL"
+    rmn "     BACKED UP ${rman_arch_copies} TIMES TO DEVICE TYPE '${rman_device_type}'"
+    rmn "     COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
     ;;
   lvl0|lvl1)
     local l_level=${g_backup_type/lvl} # level number (0 or 1)
@@ -523,6 +508,7 @@ gen_rman_cmd() {
     g_rman_format="%d_df_lvl${l_level}_%s_%p_%t_%T"
     g_rman_tag="LVL${l_level}_$(date +%d%m%Y_%H%M)"
 
+    rman_allocate_channels
     rmn "   BACKUP $(rman_compress)"
     rmn "     INCREMENTAL LEVEL ${l_level}"
     rmn "     FORMAT '$(rman_format)'"
@@ -531,6 +517,9 @@ gen_rman_cmd() {
     [[ -n ${rman_keepdays} ]] && \
     rmn "     KEEP UNTIL TIME 'SYSDATE+${rman_keepdays}'"
     rmn "     DATABASE;"
+
+    rmn "   DELETE NOPROMPT OBSOLETE;"
+        
     # archivelogs backup
     g_rman_format="%d_al_%s_%p_%t_%T"
     g_rman_tag="AL_$(date +%d%m%Y_%H%M)"
@@ -542,23 +531,26 @@ gen_rman_cmd() {
       rmn "     FORMAT '$(rman_format)'"
       rmn "     TAG '$(rman_tag)'"
       rmn "     FILESPERSET 20"
-      rmn "     ARCHIVELOG ALL NOT BACKED UP 1 TIMES"
-      rmn "     $(rman_al_delete);"
+      rmn "     ARCHIVELOG ALL NOT BACKED UP ${rman_arch_copies} TIMES;"
+      rmn "   DELETE NOPROMPT ARCHIVELOG ALL"
+      rmn "     BACKED UP ${rman_arch_copies} TIMES TO DEVICE TYPE '${rman_device_type}'"
+      rmn "     COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
     fi
-    
-    rmn "   DELETE NOPROMPT OBSOLETE;"
     ;;
   esac
+  
   # CF backup
-  g_rman_format="%d_cf_%s_%p_%t_%T"
-  g_rman_tag="CF_$(date +%d%m%Y_%H%M)"
-  rmn "   BACKUP $(rman_compress)"
-  rmn "     FORMAT '$(rman_format)'"
-  rmn "     TAG '$(rman_tag)'"
-  rmn "     CURRENT CONTROLFILE;"
-  rmn "   CROSSCHECK BACKUP;"
-  rmn "   CROSSCHECK ARCHIVELOG ALL;"
-  rman_release_channels
+  if [[ ${g_backup_type} != "archdel" ]]; then
+    g_rman_format="%d_cf_%s_%p_%t_%T"
+    g_rman_tag="CF_$(date +%d%m%Y_%H%M)"
+    rmn "   BACKUP $(rman_compress)"
+    rmn "     FORMAT '$(rman_format)'"
+    rmn "     TAG '$(rman_tag)'"
+    rmn "     CURRENT CONTROLFILE;"
+    rmn "   CROSSCHECK BACKUP;"
+    # rmn "   CROSSCHECK ARCHIVELOG ALL;"
+    rman_release_channels
+  fi
   rmn "}"
   
   # Post-backup reports
@@ -596,8 +588,7 @@ exec_rman() {
   if [[ $? == 0 ]]; then
     g_backup_status="SUCCESS"
     # Check RMAN log file for warnings
-    # RMAN-08120 is an exception (attempt to delete archivelogs not applied to standby)
-    egrep "RMAN-|ORA-" "${g_rman_log_file}" | egrep -v "RMAN-08120" >/dev/null 2>&1 && g_backup_status="WARNING"
+    egrep "RMAN-|ORA-" "${g_rman_log_file}" | egrep -vq "${RMAN_ERR_FILTER}" && g_backup_status="WARNING"
   else
     g_backup_status="FAILED"
   fi
@@ -828,8 +819,7 @@ main() {
   log_header
   force_logging disable
   send_log
-  cleanup
 }
 
-trap cleanup 1 2 15
+trap cleanup 1 2 15 EXIT
 main "$@"
