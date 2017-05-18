@@ -821,5 +821,5 @@ main() {
   send_log
 }
 
-trap cleanup 1 2 15 EXIT
+trap cleanup 0 1 2 15
 main "$@"
