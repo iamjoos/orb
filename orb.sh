@@ -23,6 +23,8 @@
 #            | New RMAN error filter
 #            | rman_arch_copies parameter
 #            | Rolled back changes to rman_al_delete added on 28/11/2016
+# 24/05/2017 | Password enc/dec (required for backups of standby database)
+# 06/07/2017 | Bugfixes
 ################################################################################
 # set -x
 #-------------------------------------------------------------------------------
@@ -31,7 +33,8 @@
 PROGNAME="$(basename "$0")"
 PROGDIR="$(readlink -f "$(dirname "$0")")"
 CONFIG_FILE="${PROGDIR}/orb.conf"
-ORB_LOG_FILE="${PROGDIR}/orb.log" # Global log file, stores info about all backups
+ORB_LOG_FILE="${PROGDIR}/orb.log"       # Global log file, stores info about all backups
+PWDPHRASE_FILE="${PROGDIR}/.orb.secret" # This file stores passphrase to decrypt passwords
 # Errors to filter out:
 #  RMAN-08120 - archived log not deleted, not yet applied by standby
 #  RMAN-08137 - archived log not deleted, needed for standby or upstream capture process
@@ -53,11 +56,11 @@ g_rman_cmd_file=""            # RMAN command file
 g_backup_status="NOT_STARTED" # backup status
 g_rman_format=""              # RMAN backup name format
 g_rman_tag=""                 # RMAN backup tag format
-g_rman_start=""               # RMAN start time
-g_rman_end=""                 # RMAN end time
+g_rman_starttime=""           # RMAN start time
+g_rman_endtime=""             # RMAN end time
 g_force_logging=""            # force logging flag
 g_sql_result=""               # SQL*Plus output
-
+g_sys_pwd=""                  # SYS password decrypted with getsyspwd
 
 #-------------------------------------------------------------------------------
 # Default configuration
@@ -77,6 +80,7 @@ rman_tag=""                     # Custom RMAN tag
 rman_arch_keep_hrs=0            # How long archivelogs should be retained after being backed up
 rman_arch_copies=1              # How many archivelog copies should be kept
 maillist="root@$(hostname -s)"  # Comma separated list of email recipients
+sys_pwd_hash=""                 # Hashed SYS password (see getsyspwd fucntion)
 
 #-------------------------------------------------------------------------------
 # Print script usage
@@ -471,8 +475,15 @@ gen_rman_cmd() {
   sql "select count(*) from v\$archive_dest where target='STANDBY'"
   local l_stb_cnt="${g_sql_result}"
   
-  prn dbg "----------------------------- RMAN CMD BEGIN ---------------------------"  
-  rmn "CONNECT TARGET /;"
+  prn dbg "----------------------------- RMAN CMD BEGIN ---------------------------"
+  
+  if [[ "${g_db_role}" == "PHYSICAL STANDBY" ]]; then
+    getsyspwd
+    rmn "CONNECT TARGET SYS/${g_sys_pwd};"
+  else
+    rmn "CONNECT TARGET /;"
+  fi
+  
   [[ ${g_db_role} == "PRIMARY" ]] && rmn "CONFIGURE RETENTION POLICY TO $(rman_retention);" # doesn't work on standby
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE ${rman_device_type} TO '$(rman_cf_format)';"
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP ON;"
@@ -490,6 +501,7 @@ gen_rman_cmd() {
     g_rman_tag="AL_$(date +%d%m%Y_%H%M)"
     
     rman_allocate_channels
+    [[ ${g_db_role} == "PRIMARY" ]] && \
     rmn "   SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';"
     rmn "   BACKUP $(rman_compress)"
     rmn "     FORMAT '$(rman_format)'"
@@ -517,8 +529,9 @@ gen_rman_cmd() {
     [[ -n ${rman_keepdays} ]] && \
     rmn "     KEEP UNTIL TIME 'SYSDATE+${rman_keepdays}'"
     rmn "     DATABASE;"
-
-    rmn "   DELETE NOPROMPT OBSOLETE;"
+    
+    # Passing retention policy explicitly, because CONFIGURE RETENTION POLICY doesn't work on standby
+    rmn "   DELETE NOPROMPT OBSOLETE $(rman_retention);"
         
     # archivelogs backup
     g_rman_format="%d_al_%s_%p_%t_%T"
@@ -526,6 +539,7 @@ gen_rman_cmd() {
     # If KEEP UNTIL is NOT used, backup archivelogs
     # If KEEP UNTIL is used, RMAN will back them up automatically (11g feature)
     if [[ -z ${rman_keepdays} ]]; then
+      [[ ${g_db_role} == "PRIMARY" ]] && \
       rmn "   SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';"
       rmn "   BACKUP $(rman_compress)"
       rmn "     FORMAT '$(rman_format)'"
@@ -555,6 +569,7 @@ gen_rman_cmd() {
   
   # Post-backup reports
   rmn "LIST BACKUP SUMMARY;"
+  [[ ${g_db_role} == "PRIMARY" ]] && \
   rmn "REPORT NEED BACKUP;"
   rmn "LIST EXPIRED BACKUP;"
   rmn "LIST EXPIRED ARCHIVELOG ALL;"
@@ -563,6 +578,7 @@ gen_rman_cmd() {
   
   return 0
 }
+
 #-------------------------------------------------------------------------------
 # Execute RMAN script
 # Parameters:
@@ -577,10 +593,10 @@ exec_rman() {
 
   local l_etime # uid for this backup session in the global log
   l_etime=$(date +%s) 
-  g_rman_start=$(date +%Y-%m-%d\ %H:%M:%S)
-  echo "${g_rman_start} ${g_db_name}:${g_backup_type}:${l_etime}:START" >> "${ORB_LOG_FILE}"
+  g_rman_starttime=$(date +%Y-%m-%d\ %H:%M:%S)
+  echo "${g_rman_starttime} ${g_db_name}:${g_backup_type}:${l_etime}:START" >> "${ORB_LOG_FILE}"
   
-  prn inf "RMAN started at: ${g_rman_start}"
+  prn inf "RMAN started at: ${g_rman_starttime}"
   prn dbg "${ORACLE_HOME}/bin/rman cmdfile=${g_rman_cmd_file} log=${g_rman_log_file}"
   prn inf "RMAN is running. For details, please monitor ${g_rman_log_file}"
   "${ORACLE_HOME}"/bin/rman cmdfile="${g_rman_cmd_file}" log="${g_rman_log_file}" 1>/dev/null
@@ -593,12 +609,12 @@ exec_rman() {
     g_backup_status="FAILED"
   fi
 
-  g_rman_end=$(date +%Y-%m-%d\ %H:%M:%S)
+  g_rman_endtime=$(date +%Y-%m-%d\ %H:%M:%S)
   
-  prn inf "RMAN ended at: ${g_rman_end}"
+  prn inf "RMAN ended at: ${g_rman_endtime}"
   prn inf "Backup status: ${g_backup_status}"
   
-  echo "${g_rman_end} ${g_db_name}:${g_backup_type}:${l_etime}:${g_backup_status}" >> "${ORB_LOG_FILE}"
+  echo "${g_rman_endtime} ${g_db_name}:${g_backup_type}:${l_etime}:${g_backup_status}" >> "${ORB_LOG_FILE}"
   
   # Add RMAN log to the log file
   cat "${g_rman_log_file}" >> "${g_log_file}" && rm "${g_rman_log_file}"
@@ -656,8 +672,9 @@ log_header() {
   [[ -n "${g_opt_flags}" ]] && \
   prn log "Additional flags: ${g_opt_flags}"
   prn log "RMAN log file   : ${g_log_file}"
-  prn log "Start time      : ${g_rman_start}"
-  prn log "End time        : ${g_rman_end}"
+  prn log "Start time      : ${g_rman_starttime}"
+  prn log "End time        : ${g_rman_endtime}"
+  prn log "Backup status   : ${g_backup_status}"
   prn log "################################################################################"
   
   cat "${g_log_file}.tmp" >> "${g_log_file}" && rm "${g_log_file}.tmp"
@@ -790,6 +807,25 @@ cleanup() {
     prn dbg "Removing ${g_rman_cmd_file}"
     rm "${g_rman_cmd_file}"
   fi
+  
+  return 0
+}
+
+#-------------------------------------------------------------------------------
+# Decrypt SYS password hash
+# HOWTO:
+#   Put a passprase into ${PWDPHRASE_FILE} (default: orb.secret)
+#   Generate hash with the following command and put it into sys_pwd_hash in the main file:
+#   read -s syspwd && echo syspwd | openssl aes-256-cbc -a -salt -kfile ${PWDPHRASE_FILE}
+# Parameters:
+#  none
+#-------------------------------------------------------------------------------
+getsyspwd() {
+  [[ ! -f "${PWDPHRASE_FILE}" ]] && prn fatal "Passphrase file ${PWDPHRASE_FILE} doesn't exists"
+  [[ -z ${sys_pwd_hash} ]]       && prn fatal "No SYS password for database ${g_db_name} found in ${CONFIG_FILE}"
+  
+  g_sys_pwd=$(echo "${sys_pwd_hash}" | openssl aes-256-cbc -a -d -salt -kfile "${PWDPHRASE_FILE}" 2>/dev/null)
+  [[ -z ${g_sys_pwd} ]] && prn fatal "Unable to decrypt SYS password"
   
   return 0
 }
