@@ -16,8 +16,8 @@
 # 26/12/2016 | Debugging improvements
 #            | Reworked sql function
 # 31/01/2017 | Moved "DELETE OBSOLETE" right after DF backup instead of AL backup
-#            | because otherwise automatic CF backup taken after DF backup for databases with retention=1
-#            | was removed and it caused issues with duplicate
+#            | because otherwise automatic CF backup taken after DF backup for
+#            | databases with retention=1 was removed and it caused issues with duplicate
 # 11/05/2017 | Bugfixes
 #            | Removed unnecessary cleanup calls
 #            | New RMAN error filter
@@ -25,6 +25,9 @@
 #            | Rolled back changes to rman_al_delete added on 28/11/2016
 # 24/05/2017 | Password enc/dec (required for backups of standby database)
 # 06/07/2017 | Bugfixes
+# 31/07/2017 | Reworked the KEEP option to not use archival backups as it doesn't
+#            | work on a standby database
+#            | Some code refactoring
 ################################################################################
 # set -x
 #-------------------------------------------------------------------------------
@@ -44,23 +47,22 @@ RMAN_ERR_FILTER="RMAN-08120|RMAN-08137|RMAN-08138"
 #-------------------------------------------------------------------------------
 # GLOBAL VARIABLES
 #-------------------------------------------------------------------------------
-g_db_name=""                  # database name
-g_backup_type=""              # backup type
-g_inst_status=""              # instance status
-g_db_role=""                  # database role
-g_opt_flags=""                # additional options passed to the script
-g_log_file=""                 # log file
-g_rman_log_file=""            # RMAN log file
-g_lock_file=""                # lock file
-g_rman_cmd_file=""            # RMAN command file
-g_backup_status="NOT_STARTED" # backup status
-g_rman_format=""              # RMAN backup name format
-g_rman_tag=""                 # RMAN backup tag format
-g_rman_starttime=""           # RMAN start time
-g_rman_endtime=""             # RMAN end time
-g_force_logging=""            # force logging flag
-g_sql_result=""               # SQL*Plus output
-g_sys_pwd=""                  # SYS password decrypted with getsyspwd
+g_db_name=""                          # database name
+g_backup_type=""                      # backup type
+g_inst_status=""                      # instance status
+g_db_role=""                          # database role
+g_opt_flags=""                        # additional options passed to the script
+g_log_file=""                         # log file
+g_rman_log_file=""                    # RMAN log file
+g_lock_file=""                        # lock file
+g_rman_cmd_file=""                    # RMAN command file
+g_backup_status="NOT_STARTED"         # backup status
+g_rman_format=""                      # RMAN backup name format
+g_rman_starttime=""                   # RMAN start time
+g_rman_endtime=""                     # RMAN end time
+g_force_logging=""                    # force logging flag
+g_sql_result=""                       # SQL*Plus output
+g_sys_pwd=""                          # SYS password decrypted with getsyspwd
 
 #-------------------------------------------------------------------------------
 # Default configuration
@@ -116,45 +118,26 @@ prn() {
   local l_msgtext
 
   case ${#@} in
-    1)
-      l_msgtext="$1"
-      ;;
-    2)
-      l_msgtext="$2"
-      l_msgtype="$1"
-      ;;
-    *)
-      return 0
-      ;;
+    1) l_msgtext="$1" ;;
+    2) l_msgtext="$2" ; l_msgtype="$1" ;;
+    *) return 0 ;;
   esac
   
   case ${l_msgtype} in
-    err)
-      printf "%s\n" "[ERROR] ${l_msgtext}" >&2
-      ;;
-    inf)
-      printf "%s\n" "[INFO]  ${l_msgtext}"
-      ;;
-    dbg)
-      check_flag debug && \
-      printf "%s\n" "[DEBUG] ${l_msgtext}"
-      ;;
-    log)
-      printf "%s\n" "${l_msgtext}" >> "${g_log_file}"
-      ;;
+    err) printf "%s\n" "[ERROR] ${l_msgtext}" >&2 ;;
+    inf) printf "%s\n" "[INFO]  ${l_msgtext}" ;;
+    dbg) check_flag debug && printf "%s\n" "[DEBUG] ${l_msgtext}" ;;
+    log) printf "%s\n" "${l_msgtext}" >> "${g_log_file}" ;;
     fatal)
       printf "%s\n" "[FATAL] ${l_msgtext}" >&2
       echo "${l_msgtext}" | mailx -s "FATAL: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" "${maillist}"
       exit 1
       ;;
-    *)
-      printf "%s\n" "${l_msgtext}"
-      ;;
+    *) printf "%s\n" "${l_msgtext}" ;;
   esac
   
   return 0
 }
-
 
 #-------------------------------------------------------------------------------
 # Check/create lock file
@@ -201,23 +184,22 @@ parse_cfg() {
   fi
   . <(grep -oP "^${g_db_name}.\K.+" "${CONFIG_FILE}")
   
-  # Validations:
-  case ${rman_device_type} in
-    # archdel shouldn't require any DISK/TAPE configurations, others should
-    SBT_TAPE)
-      [[ -z ${rman_env_string}  && ${g_backup_type} != "archdel" ]] && \
+  # archdel shouldn't require any DISK/TAPE configurations, others should
+  if [[ ${g_backup_type} != "archdel" ]]; then
+    case ${rman_device_type} in
+    SBT_TAPE) 
+      [[ -z ${rman_env_string} ]] && \
         prn fatal "Tape backups require rman_env_string to be set."
       ;;
     DISK)
-      [[ -z ${rman_backup_dest} && ${g_backup_type} != "archdel" ]] && \
+      [[ -z ${rman_backup_dest} ]] && \
         prn fatal "Backup destination (rman_backup_dest) must be set."
       mkdir -p ${rman_backup_dest} 2>/dev/null || \
         prn fatal "Unable to create backup directory: ${rman_backup_dest}"
       ;;
-    *)
-      prn fatal "Unknown rman_device_type: ${rman_device_type}."
-      ;;
-  esac
+    *) prn fatal "Unknown rman_device_type: ${rman_device_type}." ;;
+    esac
+  fi
 
   return 0
 }
@@ -334,7 +316,6 @@ check_db_role() {
   return 0
 }
 
-
 #-------------------------------------------------------------------------------
 # Allocate RMAN channels
 # Parameters:
@@ -369,100 +350,6 @@ rman_release_channels() {
 }
 
 #-------------------------------------------------------------------------------
-# Generate RMAN format string
-# Parameters:
-#  none
-#-------------------------------------------------------------------------------
-rman_format() {
-  case ${rman_device_type} in
-  SBT_TAPE)
-    echo "${g_rman_format}"
-    ;;
-  DISK)
-    echo "${rman_backup_dest}/${g_rman_format}.bkp"
-    ;;
-  esac
-
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-# Generate RMAN tag
-# Parameters:
-#  none
-#-------------------------------------------------------------------------------
-rman_tag() {
-  local l_tag=""
-  local l_keepuntil=""
-  # if tag specified in config or cmd line, use it. Otherwise, use generic tag
-  if [[ -n ${rman_tag} ]]; then
-    l_tag="${rman_tag}"
-  else
-    l_tag="${g_rman_tag}"
-  fi
-
-  # add "_E{expiration_date}" to the tag if keep option specified
-  if [[ -n ${rman_keepdays} ]]; then
-    sql "select to_char(sysdate+${rman_keepdays},'DDMMYYYY') from dual"
-    l_keepuntil="${g_sql_result}"
-    l_tag="${l_tag}_E${l_keepuntil}"
-  fi
-
-  echo ${l_tag}
-  
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-# Generate RMAN controlfile autobackup name
-# Parameters:
-#  none
-#-------------------------------------------------------------------------------
-rman_cf_format() {
-  case ${rman_device_type} in
-  SBT_TAPE)
-    echo "%F"
-    ;;
-  DISK)
-    echo "${rman_backup_dest}/%F"
-    ;;
-  esac
-
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-# Generate RMAN retention policy
-# Parameters:
-#  none
-#-------------------------------------------------------------------------------
-rman_retention() {
-  # Use redundancy if it's set, otherwise use window
-  if [[ -n "${rman_redundancy}" ]]; then
-    echo "REDUNDANCY ${rman_redundancy}"
-  else
-    echo "RECOVERY WINDOW OF ${rman_recovery_window} DAYS"
-  fi
-
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-# RMAN compression settings
-# Parameters:
-#  none
-#-------------------------------------------------------------------------------
-rman_compress() {
-  if [[ ${rman_compressed} == "yes" ]]; then
-    echo "AS COMPRESSED BACKUPSET"
-  else
-    echo ""
-  fi
-
-  return 0
-}
-
-#-------------------------------------------------------------------------------
 # Generate RMAN command file
 # Parameters:
 #  none
@@ -471,9 +358,47 @@ gen_rman_cmd() {
   g_rman_cmd_file="/tmp/${g_db_name}_${g_backup_type}.rman"
   cat /dev/null > ${g_rman_cmd_file}
 
+  local l_stb_cnt                             # number of standby databases
+  local l_compress                            # RMAN backup compression
+  local l_retention                           # RMAN backup retention
+  local l_acf_name                            # controlfile autbackup name
+  local l_rman_tag_sfx="$(date +%d%m%Y_%H%M)" # RMAN backup tag suffix  
+  
   # check if the database has standby
   sql "select count(*) from v\$archive_dest where target='STANDBY'"
-  local l_stb_cnt="${g_sql_result}"
+  l_stb_cnt="${g_sql_result}"
+  
+  # set compression level
+  if [[ ${rman_compressed} == "yes" ]]; then
+    l_compress="AS COMPRESSED BACKUPSET"
+  else
+    l_compress=""
+  fi
+  
+  # set retention policy
+  if [[ -n "${rman_redundancy}" ]]; then
+    l_retention="REDUNDANCY ${rman_redundancy}"
+  else
+    l_retention="RECOVERY WINDOW OF ${rman_recovery_window} DAYS"
+  fi
+  
+  # set controlfile autobackup name
+  case ${rman_device_type} in
+    SBT_TAPE) l_acf_name="%F" ;;
+    DISK)     l_acf_name="${rman_backup_dest}/%F" ;;
+  esac
+  
+  # add backup expiration date to backup tag
+  if [[ -n ${rman_keepdays} ]]; then
+    sql "select to_char(sysdate+${rman_keepdays},'DDMMYYYY') from dual"
+    l_rman_tag_sfx="${l_rman_tag_sfx}_E${g_sql_result}"
+  fi
+  
+  # build RMAN format string ('orbkptype' will be replaced)
+  case ${rman_device_type} in
+  SBT_TAPE) g_rman_format="%d_orbkptype_%s_%p_%t_%T" ;;
+  DISK)     g_rman_format="${rman_backup_dest}/%d_orbkptype_%s_%p_%t_%T.bkp" ;;
+  esac
   
   prn dbg "----------------------------- RMAN CMD BEGIN ---------------------------"
   
@@ -484,8 +409,8 @@ gen_rman_cmd() {
     rmn "CONNECT TARGET /;"
   fi
   
-  [[ ${g_db_role} == "PRIMARY" ]] && rmn "CONFIGURE RETENTION POLICY TO $(rman_retention);" # doesn't work on standby
-  rmn "CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE ${rman_device_type} TO '$(rman_cf_format)';"
+  [[ ${g_db_role} == "PRIMARY" ]] && rmn "CONFIGURE RETENTION POLICY TO ${l_retention};" # doesn't work on standby
+  rmn "CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE ${rman_device_type} TO '${l_acf_name}';"
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP ON;"
   (( ${l_stb_cnt} )) && rmn "CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;"
   rmn "RUN {"
@@ -497,19 +422,17 @@ gen_rman_cmd() {
     rmn "     COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
     ;;
   arch)
-    g_rman_format="%d_al_%s_%p_%t_%T"
-    g_rman_tag="AL_$(date +%d%m%Y_%H%M)"
     
     rman_allocate_channels
     [[ ${g_db_role} == "PRIMARY" ]] && \
     rmn "   SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';"
-    rmn "   BACKUP $(rman_compress)"
-    rmn "     FORMAT '$(rman_format)'"
-    rmn "     TAG '$(rman_tag)'"
+    rmn "   BACKUP ${l_compress}"
     rmn "     FILESPERSET 20"
-    [[ -n ${rman_keepdays} ]] && \
-    rmn "     KEEP UNTIL TIME 'SYSDATE+${rman_keepdays}'"
+    rmn "     FORMAT '${g_rman_format/orbkptype/al}'"
+    rmn "     TAG '${rman_tag:-AL_${l_rman_tag_sfx}}'"
     rmn "     ARCHIVELOG ALL NOT BACKED UP ${rman_arch_copies} TIMES;"
+    [[ -n ${rman_keepdays} ]] && \
+    rmn "   CHANGE BACKUP TAG '${rman_tag:-AL_${l_rman_tag_sfx}}' KEEP UNTIL TIME 'SYSDATE+${rman_keepdays}';"
     rmn "   DELETE NOPROMPT ARCHIVELOG ALL"
     rmn "     BACKED UP ${rman_arch_copies} TIMES TO DEVICE TYPE '${rman_device_type}'"
     rmn "     COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
@@ -517,35 +440,41 @@ gen_rman_cmd() {
   lvl0|lvl1)
     local l_level=${g_backup_type/lvl} # level number (0 or 1)
     
-    g_rman_format="%d_df_lvl${l_level}_%s_%p_%t_%T"
-    g_rman_tag="LVL${l_level}_$(date +%d%m%Y_%H%M)"
-
     rman_allocate_channels
-    rmn "   BACKUP $(rman_compress)"
+    rmn "   BACKUP ${l_compress}"
     rmn "     INCREMENTAL LEVEL ${l_level}"
-    rmn "     FORMAT '$(rman_format)'"
-    rmn "     TAG '$(rman_tag)'"
+    rmn "     FORMAT '${g_rman_format/orbkptype/df_lvl${l_level}}'"
+    rmn "     TAG '${rman_tag:-LVL${l_level}_${l_rman_tag_sfx}}'"
     rmn "     FILESPERSET 1"
-    [[ -n ${rman_keepdays} ]] && \
-    rmn "     KEEP UNTIL TIME 'SYSDATE+${rman_keepdays}'"
     rmn "     DATABASE;"
     
+    [[ -z ${rman_keepdays} ]] && \
     # Passing retention policy explicitly, because CONFIGURE RETENTION POLICY doesn't work on standby
-    rmn "   DELETE NOPROMPT OBSOLETE $(rman_retention);"
+    rmn "   DELETE NOPROMPT OBSOLETE ${l_retention};"
         
     # archivelogs backup
-    g_rman_format="%d_al_%s_%p_%t_%T"
-    g_rman_tag="AL_$(date +%d%m%Y_%H%M)"
-    # If KEEP UNTIL is NOT used, backup archivelogs
-    # If KEEP UNTIL is used, RMAN will back them up automatically (11g feature)
-    if [[ -z ${rman_keepdays} ]]; then
-      [[ ${g_db_role} == "PRIMARY" ]] && \
-      rmn "   SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';"
-      rmn "   BACKUP $(rman_compress)"
-      rmn "     FORMAT '$(rman_format)'"
-      rmn "     TAG '$(rman_tag)'"
-      rmn "     FILESPERSET 20"
-      rmn "     ARCHIVELOG ALL NOT BACKED UP ${rman_arch_copies} TIMES;"
+    [[ ${g_db_role} == "PRIMARY" ]] && \
+    rmn "   SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';"
+    rmn "   BACKUP ${l_compress}"
+    rmn "     FILESPERSET 20"
+    rmn "     FORMAT '${g_rman_format/orbkptype/al}'"
+    if [[ -n ${rman_keepdays} ]]; then
+      # using CHANGE ... KEEP UNTIL here due to RMAN-08417 on standby DBs
+      rmn "     TAG '${rman_tag:-LVL${l_level}_${l_rman_tag_sfx}}'"
+      rmn "     ARCHIVELOG FROM TIME \"to_date('$(date +%F\ %T)', 'YYYY-MM-DD HH24:MI:SS')\";"
+      rmn "   BACKUP ${l_compress}"
+      rmn "     FORMAT '${g_rman_format/orbkptype/spf}'"
+      rmn "     TAG '${rman_tag:-LVL${l_level}_${l_rman_tag_sfx}}'"
+      rmn "     SPFILE;"
+      rmn "   BACKUP ${l_compress}"
+      rmn "     FORMAT '${g_rman_format/orbkptype/cf}'"
+      rmn "     TAG '${rman_tag:-LVL${l_level}_${l_rman_tag_sfx}}'"
+      rmn "     CURRENT CONTROLFILE;"
+      rmn "   CHANGE BACKUP TAG '${rman_tag:-LVL${l_level}_${l_rman_tag_sfx}}' KEEP UNTIL TIME 'SYSDATE+${rman_keepdays}';"
+    else
+      rmn "     TAG '${rman_tag:-AL_${l_rman_tag_sfx}}'"
+      rmn "     ARCHIVELOG ALL"
+      rmn "     NOT BACKED UP ${rman_arch_copies} TIMES;"
       rmn "   DELETE NOPROMPT ARCHIVELOG ALL"
       rmn "     BACKED UP ${rman_arch_copies} TIMES TO DEVICE TYPE '${rman_device_type}'"
       rmn "     COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
@@ -553,16 +482,15 @@ gen_rman_cmd() {
     ;;
   esac
   
-  # CF backup
+  # CF backup (except for archdel and long-term backup)
   if [[ ${g_backup_type} != "archdel" ]]; then
-    g_rman_format="%d_cf_%s_%p_%t_%T"
-    g_rman_tag="CF_$(date +%d%m%Y_%H%M)"
-    rmn "   BACKUP $(rman_compress)"
-    rmn "     FORMAT '$(rman_format)'"
-    rmn "     TAG '$(rman_tag)'"
-    rmn "     CURRENT CONTROLFILE;"
+    if [[ -z ${rman_keepdays} ]]; then
+      rmn "   BACKUP ${l_compress}"
+      rmn "     FORMAT '${g_rman_format/orbkptype/cf}'"
+      rmn "     TAG '${rman_tag:-CF_${l_rman_tag_sfx}}'"
+      rmn "     CURRENT CONTROLFILE;"
+    fi
     rmn "   CROSSCHECK BACKUP;"
-    # rmn "   CROSSCHECK ARCHIVELOG ALL;"
     rman_release_channels
   fi
   rmn "}"
@@ -829,7 +757,6 @@ getsyspwd() {
   
   return 0
 }
-
 
 ################################################################################
 # MAIN
