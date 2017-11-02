@@ -28,6 +28,7 @@
 # 31/07/2017 | Reworked the KEEP option to not use archival backups as it doesn't
 #            | work on a standby database
 #            | Some code refactoring
+# 02/11/2017 | Backup validation with t=validate
 ################################################################################
 # set -x
 #-------------------------------------------------------------------------------
@@ -93,10 +94,11 @@ usage() {
   echo "Usage: ${PROGNAME} d=<db_name> t=<backup_type> [<options>]"
   echo "  db_name     - Database name defined in orb.conf"
   echo "  backup_type:"
-  echo "    lvl0    - RMAN incremental level 0 backup"
-  echo "    lvl1    - RMAN incremental level 1 backup"
-  echo "    arch    - RMAN archivelog backup"
-  echo "    archdel - Delete archivelogs"
+  echo "    lvl0     - RMAN incremental level 0 backup"
+  echo "    lvl1     - RMAN incremental level 1 backup"
+  echo "    arch     - RMAN archivelog backup"
+  echo "    archdel  - Delete archivelogs"
+  echo "    valdiate - Validate RMAN backup"
   echo "  options:"
   echo "    nomail    - Do not send email notifications"
   echo "    debug     - Show debug information"
@@ -399,6 +401,17 @@ gen_rman_cmd() {
   SBT_TAPE) g_rman_format="%d_orbkptype_%s_%p_%t_%T" ;;
   DISK)     g_rman_format="${rman_backup_dest}/%d_orbkptype_%s_%p_%t_%T.bkp" ;;
   esac
+
+  # determine SCN for backup validation
+  if [[ "${g_backup_type}" == "validate" ]]; then
+      sql "select to_char(min(change#)) from (
+           select file#, max(checkpoint_change#) change#
+           from v\$backup_datafile
+           group by file#)"
+      local l_validate_scn_min=$((${g_sql_result})) # convert string to number
+      sql "select to_char(max(checkpoint_change#)) from v\$backup_datafile where file#<>0"
+      local l_validate_scn_max=$((${g_sql_result})) # convert string to number
+  fi
   
   prn dbg "----------------------------- RMAN CMD BEGIN ---------------------------"
   
@@ -413,9 +426,17 @@ gen_rman_cmd() {
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE ${rman_device_type} TO '${l_acf_name}';"
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP ON;"
   (( ${l_stb_cnt} )) && rmn "CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;"
+  
   rmn "RUN {"
 
   case ${g_backup_type} in
+  validate)
+    rman_allocate_channels
+    #rmn "   SET UNTIL SCN ${l_validate_scn_max};"
+    rmn "   RESTORE DATABASE UNTIL SCN ${l_validate_scn_max} VALIDATE;"
+    rmn "   RESTORE ARCHIVELOG FROM SCN ${l_validate_scn_min} UNTIL SCN ${l_validate_scn_max} VALIDATE;"
+    rman_release_channels
+    ;;
   archdel)
     # rmn "   CROSSCHECK ARCHIVELOG ALL;"
     rmn "   DELETE NOPROMPT ARCHIVELOG ALL"
@@ -482,8 +503,8 @@ gen_rman_cmd() {
     ;;
   esac
   
-  # CF backup (except for archdel and long-term backup)
-  if [[ ${g_backup_type} != "archdel" ]]; then
+  # CF backup (except for archdel, validate, and long-term backup)
+  if [[ ${g_backup_type} != "archdel" && ${g_backup_type} != "validate" ]]; then
     if [[ -z ${rman_keepdays} ]]; then
       rmn "   BACKUP ${l_compress}"
       rmn "     FORMAT '${g_rman_format/orbkptype/cf}'"
@@ -694,7 +715,7 @@ parse_args() {
   [[ -z ${g_backup_type} ]] && { prn err "Backup type was not specified"  ; usage; }
 
   case ${g_backup_type} in
-  lvl0|lvl1|arch|archdel)
+  lvl0|lvl1|arch|archdel|validate)
     ;;
   *)
     prn err "Unknown backup type specified: ${g_backup_type}"
