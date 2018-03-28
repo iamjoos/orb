@@ -45,6 +45,12 @@ PWDPHRASE_FILE="${PROGDIR}/.orb.secret" # This file stores passphrase to decrypt
 #  RMAN-08138 - archived log not deleted - must create more backups
 RMAN_ERR_FILTER="RMAN-08120|RMAN-08137|RMAN-08138"
 
+C_ERR="err"
+C_INF="inf"
+C_DBG="dbg"
+C_LOG="log"
+C_FATAL="fatal"
+
 #-------------------------------------------------------------------------------
 # GLOBAL VARIABLES
 #-------------------------------------------------------------------------------
@@ -112,34 +118,42 @@ usage() {
 #-------------------------------------------------------------------------------
 # Print a message
 # Parameters
-#  1 - message type, or message text when only one parameter passed
-#  2 - message text
+#  --type <text> - message type, or message text when only one parameter passed
+#  --code <int>  - exit code
+#  --text <text> - message text
 #-------------------------------------------------------------------------------
 prn() {
   local l_msgtype
   local l_msgtext
+  local l_exitcode
 
-  case ${#@} in
-    1) l_msgtext="$1" ;;
-    2) l_msgtext="$2" ; l_msgtype="$1" ;;
-    *) return 0 ;;
-  esac
-  
+  while [ "$1" != "" ] ; do
+    case "$1" in
+      --type) l_msgtype="$2";;
+      --text) l_msgtext="$2";;
+      --code) l_exitcode="$2";;
+    esac
+    shift 2
+  done
+
   case ${l_msgtype} in
-    err) printf "%s\n" "[ERROR] ${l_msgtext}" >&2 ;;
-    inf) printf "%s\n" "[INFO]  ${l_msgtext}" ;;
-    dbg) check_flag debug && printf "%s\n" "[DEBUG] ${l_msgtext}" ;;
-    log) printf "%s\n" "${l_msgtext}" >> "${g_log_file}" ;;
-    fatal)
+    "${C_ERR}") printf "%s\n" "[ERROR] ${l_msgtext}" >&2 ;;
+    "${C_INF}") printf "%s\n" "[INFO]  ${l_msgtext}" ;;
+    "${C_DBG}") check_flag debug && printf "%s\n" "[DEBUG] ${l_msgtext}" ;;
+    "${C_LOG}") printf "%s\n" "${l_msgtext}" >> "${g_log_file}" ;;
+    "${C_FATAL}")
       printf "%s\n" "[FATAL] ${l_msgtext}" >&2
       echo "${l_msgtext}" | mailx -s "FATAL: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" "${maillist}"
       exit 1
       ;;
     *) printf "%s\n" "${l_msgtext}" ;;
   esac
-  
+
+  [[ -n "${l_exitcode}" ]] && exit "${l_exitcode}"
+
   return 0
 }
+
 
 #-------------------------------------------------------------------------------
 # Check/create lock file
@@ -147,19 +161,21 @@ prn() {
 #  none
 #-------------------------------------------------------------------------------
 lockfile() {
+  local l_pid
   g_lock_file="${PROGDIR}/${g_db_name}_${g_backup_type}.lck"
+  l_pid=$(cat "${g_lock_file}")
+
   if [[ -f "${g_lock_file}" ]]; then
-    if kill -0 $(cat "${g_lock_file}") 2>/dev/null; then
-      prn err "Another backup with PID=$(cat "${g_lock_file}") is running. Exiting."
-      exit 1
+    if kill -0 "${l_pid}" 2>/dev/null; then
+      prn --code 1 --type "${C_ERR}" --text "Another backup with PID=${l_pid} is running. Exiting."
     else
-      prn inf "Lock file ${g_lock_file} exists, but no backup with PID=$(cat "${g_lock_file}") is running. Removing lock file."
+      prn --type "${C_INF}" --text "Lock file ${g_lock_file} exists, but no backup with PID=${l_pid} is running. Removing lock file."
       rm "${g_lock_file}"
     fi
   fi
-  
+
   echo $$ > "${g_lock_file}" 2>/dev/null || \
-    prn fatal "Unable to create lock file ${g_lock_file}"
+    prn --type "${C_FATAL}" --text "Unable to create lock file ${g_lock_file}"
   return 0
 }
 
@@ -170,36 +186,36 @@ lockfile() {
 #-------------------------------------------------------------------------------
 parse_cfg() {
   [[ ! -f "${CONFIG_FILE}" ]] && \
-    prn fatal "Errors encountered sourcing config file. Please make sure it exists."
+    prn --type "${C_FATAL}" --text "Errors encountered sourcing config file. Please make sure it exists."
   # At least one config string for g_db_name must exist
   grep -qP "^${g_db_name}." "${CONFIG_FILE}" || \
-    prn fatal "Unable to find database ${g_db_name} in config file ${CONFIG_FILE}"
+    prn --type "${C_FATAL}" --text "Unable to find database ${g_db_name} in config file ${CONFIG_FILE}"
   # to avoid issues when the vars are exported before running the script
   unset ORACLE_HOME ORACLE_SID
   # Grep lines formatted as "db_name.", remove matching pattern, and source the rest of the line
   if check_flag debug; then
-    prn dbg "----------------------------- DB CFG START -----------------------------"
+    prn --type "${C_DBG}" --text "----------------------------- DB CFG START -----------------------------"
     for l_cfg in $(grep -oP "^${g_db_name}.\K.+" "${CONFIG_FILE}"); do
-      prn dbg "${l_cfg}"
+      prn --type "${C_DBG}" --text "${l_cfg}"
     done
-    prn dbg "----------------------------- DB CFG END -------------------------------"
+    prn --type "${C_DBG}" --text "----------------------------- DB CFG END -------------------------------"
   fi
   . <(grep -oP "^${g_db_name}.\K.+" "${CONFIG_FILE}")
-  
+
   # archdel shouldn't require any DISK/TAPE configurations, others should
   if [[ ${g_backup_type} != "archdel" ]]; then
     case ${rman_device_type} in
-    SBT_TAPE) 
+    SBT_TAPE)
       [[ -z ${rman_env_string} ]] && \
-        prn fatal "Tape backups require rman_env_string to be set."
+        prn --type "${C_FATAL}" --text "Tape backups require rman_env_string to be set."
       ;;
     DISK)
       [[ -z ${rman_backup_dest} ]] && \
-        prn fatal "Backup destination (rman_backup_dest) must be set."
+        prn --type "${C_FATAL}" --text "Backup destination (rman_backup_dest) must be set."
       mkdir -p ${rman_backup_dest} 2>/dev/null || \
-        prn fatal "Unable to create backup directory: ${rman_backup_dest}"
+        prn --type "${C_FATAL}" --text "Unable to create backup directory: ${rman_backup_dest}"
       ;;
-    *) prn fatal "Unknown rman_device_type: ${rman_device_type}." ;;
+    *) prn --type "${C_FATAL}" --text "Unknown rman_device_type: ${rman_device_type}." ;;
     esac
   fi
 
@@ -213,9 +229,9 @@ parse_cfg() {
 #-------------------------------------------------------------------------------
 setenv() {
   if [[ -z "${ORACLE_HOME}" ]] || [[ -z "${ORACLE_SID}" ]]; then
-    prn fatal "ORACLE_HOME or ORACLE_SID are not set. Please check the config file."
+    prn --type "${C_FATAL}" --text "ORACLE_HOME or ORACLE_SID are not set. Please check the config file."
   elif [[ ! -d $ORACLE_HOME ]]; then
-    prn fatal "ORACLE_HOME directory ${ORACLE_HOME} doesn't exist."
+    prn --type "${C_FATAL}" --text "ORACLE_HOME directory ${ORACLE_HOME} doesn't exist."
   else
     export ORACLE_HOME ORACLE_SID
     export PATH=$ORACLE_HOME/bin:$PATH
@@ -235,7 +251,7 @@ init_log_file() {
   g_log_file="${PROGDIR}/logs/${g_db_name}/${g_db_name}_${g_backup_type}_$(date +%Y-%m-%d_%H%M%S).log"
   g_rman_log_file="${PROGDIR}/logs/${g_db_name}/${g_db_name}_${g_backup_type}_$(date +%Y-%m-%d_%H%M%S).tmp"
   mkdir -p "${PROGDIR}/logs/${g_db_name}" 2>/dev/null || \
-    prn fatal "Unable to create logs direcotry ${PROGDIR}/logs/${g_db_name}."
+    prn --type "${C_FATAL}" --text "Unable to create logs direcotry ${PROGDIR}/logs/${g_db_name}."
   return 0
 }
 
@@ -249,8 +265,8 @@ init_log_file() {
 sql() {
   local l_cmd="${1}"
   local l_sqlplus_rc
-  
-  prn dbg "SQL command: ${l_cmd}"
+
+  prn --type "${C_DBG}" --text "SQL command: ${l_cmd}"
   g_sql_result=$(
   echo "
   whenever oserror  exit 1
@@ -262,9 +278,9 @@ sql() {
   )
   l_sqlplus_rc="$?"
 
-  prn dbg "SQL result: ${g_sql_result}"
+  prn --type "${C_DBG}" --text "SQL result: ${g_sql_result}"
   if [[ ${l_sqlplus_rc} != 0 ]]; then
-    prn fatal "SQL*Plus returned an error. Exiting."
+    prn --type "${C_FATAL}" --text "SQL*Plus returned an error. Exiting."
   fi
 
   return 0
@@ -278,12 +294,12 @@ sql() {
 check_db_status() {
   sql "select status from v\$instance"
   g_inst_status=${g_sql_result}
-  
+
   case ${g_inst_status} in
     OPEN|MOUNTED)
       ;;
     *)
-      prn fatal "Instance status neither OPEN nor MOUNTED. Unable to proceed with backup."
+      prn --type "${C_FATAL}" --text "Instance status neither OPEN nor MOUNTED. Unable to proceed with backup."
       ;;
   esac
 
@@ -302,17 +318,15 @@ check_db_role() {
   case ${g_db_role} in
     PRIMARY)
       if check_flag stb_only; then
-        prn "Option stb_only specified, exiting."
-        exit 0
+        prn --code 0 --text "Option stb_only specified, exiting."
       fi
       ;;
     "PHYSICAL STANDBY")
       if check_flag prm_only; then
-        prn "Option prm_only specified, exiting"
-        exit 0
+        prn --code 0 --text "Option prm_only specified, exiting"
       fi
       ;;
-    *) prn fatal "Unknown database role." ;;
+    *) prn --type "${C_FATAL}" --text "Unknown database role." ;;
   esac
 
   return 0
@@ -347,7 +361,7 @@ rman_release_channels() {
   for ((i=1; i<=rman_channels; i++)) ; do
     rmn "   RELEASE CHANNEL CH${i};"
   done
-  
+
   return 0
 }
 
@@ -364,38 +378,38 @@ gen_rman_cmd() {
   local l_compress                            # RMAN backup compression
   local l_retention                           # RMAN backup retention
   local l_acf_name                            # controlfile autbackup name
-  local l_rman_tag_sfx="$(date +%d%m%Y_%H%M)" # RMAN backup tag suffix  
-  
+  local l_rman_tag_sfx="$(date +%d%m%Y_%H%M)" # RMAN backup tag suffix
+
   # check if the database has standby
   sql "select count(*) from v\$archive_dest where target='STANDBY'"
   l_stb_cnt="${g_sql_result}"
-  
+
   # set compression level
   if [[ ${rman_compressed} == "yes" ]]; then
     l_compress="AS COMPRESSED BACKUPSET"
   else
     l_compress=""
   fi
-  
+
   # set retention policy
   if [[ -n "${rman_redundancy}" ]]; then
     l_retention="REDUNDANCY ${rman_redundancy}"
   else
     l_retention="RECOVERY WINDOW OF ${rman_recovery_window} DAYS"
   fi
-  
+
   # set controlfile autobackup name
   case ${rman_device_type} in
     SBT_TAPE) l_acf_name="%F" ;;
     DISK)     l_acf_name="${rman_backup_dest}/%F" ;;
   esac
-  
+
   # add backup expiration date to backup tag
   if [[ -n ${rman_keepdays} ]]; then
     sql "select to_char(sysdate+${rman_keepdays},'DDMMYYYY') from dual"
     l_rman_tag_sfx="${l_rman_tag_sfx}_E${g_sql_result}"
   fi
-  
+
   # build RMAN format string ('orbkptype' will be replaced)
   case ${rman_device_type} in
   SBT_TAPE) g_rman_format="%d_orbkptype_%s_%p_%t_%T" ;;
@@ -412,21 +426,21 @@ gen_rman_cmd() {
       sql "select to_char(max(checkpoint_change#)) from v\$backup_datafile where file#<>0"
       local l_validate_scn_max=$((${g_sql_result})) # convert string to number
   fi
-  
-  prn dbg "----------------------------- RMAN CMD BEGIN ---------------------------"
-  
+
+  prn --type "${C_DBG}" --text "----------------------------- RMAN CMD BEGIN ---------------------------"
+
   if [[ "${g_db_role}" == "PHYSICAL STANDBY" ]]; then
     getsyspwd
     rmn "CONNECT TARGET SYS/${g_sys_pwd};"
   else
     rmn "CONNECT TARGET /;"
   fi
-  
+
   [[ ${g_db_role} == "PRIMARY" ]] && rmn "CONFIGURE RETENTION POLICY TO ${l_retention};" # doesn't work on standby
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE ${rman_device_type} TO '${l_acf_name}';"
   rmn "CONFIGURE CONTROLFILE AUTOBACKUP ON;"
   (( ${l_stb_cnt} )) && rmn "CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;"
-  
+
   rmn "RUN {"
 
   case ${g_backup_type} in
@@ -443,7 +457,7 @@ gen_rman_cmd() {
     rmn "     COMPLETED BEFORE 'SYSDATE-${rman_arch_keep_hrs}/24';"
     ;;
   arch)
-    
+
     rman_allocate_channels
     [[ ${g_db_role} == "PRIMARY" ]] && \
     rmn "   SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';"
@@ -460,7 +474,7 @@ gen_rman_cmd() {
     ;;
   lvl0|lvl1)
     local l_level=${g_backup_type/lvl} # level number (0 or 1)
-    
+
     rman_allocate_channels
     rmn "   BACKUP ${l_compress}"
     rmn "     INCREMENTAL LEVEL ${l_level}"
@@ -468,11 +482,11 @@ gen_rman_cmd() {
     rmn "     TAG '${rman_tag:-LVL${l_level}_${l_rman_tag_sfx}}'"
     rmn "     FILESPERSET 1"
     rmn "     DATABASE;"
-    
+
     [[ -z ${rman_keepdays} ]] && \
     # Passing retention policy explicitly, because CONFIGURE RETENTION POLICY doesn't work on standby
     rmn "   DELETE NOPROMPT OBSOLETE ${l_retention};"
-        
+
     # archivelogs backup
     [[ ${g_db_role} == "PRIMARY" ]] && \
     rmn "   SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';"
@@ -502,7 +516,7 @@ gen_rman_cmd() {
     fi
     ;;
   esac
-  
+
   # CF backup (except for archdel, validate, and long-term backup)
   if [[ ${g_backup_type} != "archdel" && ${g_backup_type} != "validate" ]]; then
     if [[ -z ${rman_keepdays} ]]; then
@@ -515,7 +529,7 @@ gen_rman_cmd() {
     rman_release_channels
   fi
   rmn "}"
-  
+
   # Post-backup reports
   rmn "LIST BACKUP SUMMARY;"
   [[ ${g_db_role} == "PRIMARY" ]] && \
@@ -523,8 +537,8 @@ gen_rman_cmd() {
   rmn "LIST EXPIRED BACKUP;"
   rmn "LIST EXPIRED ARCHIVELOG ALL;"
   rmn "EXIT;"
-  prn dbg "----------------------------- RMAN CMD END -----------------------------"
-  
+  prn --type "${C_DBG}" --text "----------------------------- RMAN CMD END -----------------------------"
+
   return 0
 }
 
@@ -535,21 +549,21 @@ gen_rman_cmd() {
 #-------------------------------------------------------------------------------
 exec_rman() {
   if check_flag dryrun; then
-    prn inf "dryrun option specified, skipping backup."
+    prn --type "${C_INF}" --text "dryrun option specified, skipping backup."
     g_backup_status="SKIPPED"
     return 0
   fi
 
   local l_etime # uid for this backup session in the global log
-  l_etime=$(date +%s) 
+  l_etime=$(date +%s)
   g_rman_starttime=$(date +%Y-%m-%d\ %H:%M:%S)
   echo "${g_rman_starttime} ${g_db_name}:${g_backup_type}:${l_etime}:START" >> "${ORB_LOG_FILE}"
-  
-  prn inf "RMAN started at: ${g_rman_starttime}"
-  prn dbg "${ORACLE_HOME}/bin/rman cmdfile=${g_rman_cmd_file} log=${g_rman_log_file}"
-  prn inf "RMAN is running. For details, please monitor ${g_rman_log_file}"
+
+  prn --type "${C_INF}" --text "RMAN started at: ${g_rman_starttime}"
+  prn --type "${C_DBG}" --text "${ORACLE_HOME}/bin/rman cmdfile=${g_rman_cmd_file} log=${g_rman_log_file}"
+  prn --type "${C_INF}" --text "RMAN is running. For details, please monitor ${g_rman_log_file}"
   "${ORACLE_HOME}"/bin/rman cmdfile="${g_rman_cmd_file}" log="${g_rman_log_file}" 1>/dev/null
-  
+
   if [[ $? == 0 ]]; then
     g_backup_status="SUCCESS"
     # Check RMAN log file for warnings
@@ -559,15 +573,15 @@ exec_rman() {
   fi
 
   g_rman_endtime=$(date +%Y-%m-%d\ %H:%M:%S)
-  
-  prn inf "RMAN ended at: ${g_rman_endtime}"
-  prn inf "Backup status: ${g_backup_status}"
-  
+
+  prn --type "${C_INF}" --text "RMAN ended at: ${g_rman_endtime}"
+  prn --type "${C_INF}" --text "Backup status: ${g_backup_status}"
+
   echo "${g_rman_endtime} ${g_db_name}:${g_backup_type}:${l_etime}:${g_backup_status}" >> "${ORB_LOG_FILE}"
-  
+
   # Add RMAN log to the log file
   cat "${g_rman_log_file}" >> "${g_log_file}" && rm "${g_rman_log_file}"
-  prn inf "Backup log file: ${g_log_file}"
+  prn --type "${C_INF}" --text "Backup log file: ${g_log_file}"
   return 0
 }
 
@@ -579,11 +593,11 @@ exec_rman() {
 send_log() {
   check_flag nomail && return 0
   check_flag dryrun && return 0
-  
-  prn dbg "mailx -s \"${g_backup_status}: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)\" ${l_recipient} < \"${g_log_file}\""
+
+  prn --type "${C_DBG}" --text "mailx -s \"${g_backup_status}: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)\" ${l_recipient} < \"${g_log_file}\""
   mailx -s "${g_backup_status}: ${g_backup_type} backup of ${g_db_name}@$(hostname -s)" "${maillist}" < "${g_log_file}"
 
-  prn inf "Email sent to ${maillist}"
+  prn --type "${C_INF}" --text "Email sent to ${maillist}"
   return 0
 }
 
@@ -594,7 +608,7 @@ send_log() {
 #-------------------------------------------------------------------------------
 rmn() {
   echo "${1}" >> ${g_rman_cmd_file}
-  prn dbg "${1}"
+  prn --type "${C_DBG}" --text "${1}"
 
   return 0
 }
@@ -606,28 +620,28 @@ rmn() {
 #-------------------------------------------------------------------------------
 log_header() {
   check_flag dryrun && return 0
-  
+
   mv "${g_log_file}" "${g_log_file}.tmp"
-  
-  prn log "################################################################################"
-  prn log "ORACLE_SID      : ${ORACLE_SID}"
-  prn log "ORACLE_HOME     : ${ORACLE_HOME}"
-  prn log "Hostname        : $(hostname)"
-  prn log "Backup type     : ${g_backup_type}"
+
+  prn --type "${C_LOG}" --text "################################################################################"
+  prn --type "${C_LOG}" --text "ORACLE_SID      : ${ORACLE_SID}"
+  prn --type "${C_LOG}" --text "ORACLE_HOME     : ${ORACLE_HOME}"
+  prn --type "${C_LOG}" --text "Hostname        : $(hostname)"
+  prn --type "${C_LOG}" --text "Backup type     : ${g_backup_type}"
   [[ ${rman_device_type} == "DISK" ]] && \
-  prn log "Backup dest     : ${rman_backup_dest}"
-  prn log "Database role   : ${g_db_role}"
-  prn log "Instance status : ${g_inst_status}"
+  prn --type "${C_LOG}" --text "Backup dest     : ${rman_backup_dest}"
+  prn --type "${C_LOG}" --text "Database role   : ${g_db_role}"
+  prn --type "${C_LOG}" --text "Instance status : ${g_inst_status}"
   [[ -n "${g_opt_flags}" ]] && \
-  prn log "Additional flags: ${g_opt_flags}"
-  prn log "RMAN log file   : ${g_log_file}"
-  prn log "Start time      : ${g_rman_starttime}"
-  prn log "End time        : ${g_rman_endtime}"
-  prn log "Backup status   : ${g_backup_status}"
-  prn log "################################################################################"
-  
+  prn --type "${C_LOG}" --text "Additional flags: ${g_opt_flags}"
+  prn --type "${C_LOG}" --text "RMAN log file   : ${g_log_file}"
+  prn --type "${C_LOG}" --text "Start time      : ${g_rman_starttime}"
+  prn --type "${C_LOG}" --text "End time        : ${g_rman_endtime}"
+  prn --type "${C_LOG}" --text "Backup status   : ${g_backup_status}"
+  prn --type "${C_LOG}" --text "################################################################################"
+
   cat "${g_log_file}.tmp" >> "${g_log_file}" && rm "${g_log_file}.tmp"
-  
+
   return 0
 }
 
@@ -640,37 +654,36 @@ force_logging() {
   check_flag dryrun && return 0
   local l_cmd="$1"
   local l_fl=""
-  
+
   case ${l_cmd} in
   enable)
     sql "select force_logging from v\$database"
     g_force_logging="${g_sql_result}"
     if [[ ${g_force_logging} == "NO" ]]; then
-      prn inf "Enabling FORCE_LOGGING to make sure the backup is recoverable"
+      prn --type "${C_INF}" --text "Enabling FORCE_LOGGING to make sure the backup is recoverable"
       sql "alter database force logging"
       # double check force logging was enabled
       sql "select force_logging from v\$database"
       l_fl="${g_sql_result}"
-      [[ ${l_fl} != "YES" ]] && prn fatal "Something went wrong while enabling force logging. Exiting."
+      [[ ${l_fl} != "YES" ]] && prn --type "${C_FATAL}" --text "Something went wrong while enabling force logging. Exiting."
     fi
     ;;
   disable)
     # disable it only if it was enabled by the script
     if [[ ${g_force_logging} == "NO" ]]; then
-      prn inf "Disabling FORCE_LOGGING"
+      prn --type "${C_INF}" --text "Disabling FORCE_LOGGING"
       sql "alter database no force logging"
       # double check force logging was disabled
       sql "select force_logging from v\$database"
       l_fl="${g_sql_result}"
-      [[ ${l_fl} != "NO" ]] && prn fatal "Something went wrong while disabling force logging. Exiting."
+      [[ ${l_fl} != "NO" ]] && prn --type "${C_FATAL}" --text "Something went wrong while disabling force logging. Exiting."
     fi
     ;;
   *)
-    prn err "Unknown command: ${l_cmd}"
-    exit 1
+    prn --code 1 --type "${C_ERR}" --text "Unknown command: ${l_cmd}"
     ;;
   esac
-  
+
   return 0
 }
 
@@ -705,26 +718,26 @@ parse_args() {
       usage
       ;;
     *)
-      prn fatal "Unknown argument: ${l_arg}"
+      prn --type "${C_FATAL}" --text "Unknown argument: ${l_arg}"
       ;;
     esac
   done
 
   # Validations:
-  [[ -z ${g_db_name}     ]] && { prn err "Database name was not specified"; usage; }
-  [[ -z ${g_backup_type} ]] && { prn err "Backup type was not specified"  ; usage; }
+  [[ -z ${g_db_name}     ]] && { prn --type "${C_ERR}" --text "Database name was not specified"; usage; }
+  [[ -z ${g_backup_type} ]] && { prn --type "${C_ERR}" --text "Backup type was not specified"  ; usage; }
 
   case ${g_backup_type} in
   lvl0|lvl1|arch|archdel|validate)
     ;;
   *)
-    prn err "Unknown backup type specified: ${g_backup_type}"
+    prn --type "${C_ERR}" --text "Unknown backup type specified: ${g_backup_type}"
     usage
     ;;
   esac
 
   if check_flag stb_only && check_flag prm_only; then
-    prn fatal "Options stb_only and prm_only are mutually exclusive."
+    prn --type "${C_FATAL}" --text "Options stb_only and prm_only are mutually exclusive."
   fi
 
   return 0
@@ -748,15 +761,15 @@ check_flag() {
 #-------------------------------------------------------------------------------
 cleanup() {
   if [[ -f "${g_lock_file}" ]]; then
-    prn dbg "Removing ${g_lock_file}"
+    prn --type "${C_DBG}" --text "Removing ${g_lock_file}"
     rm "${g_lock_file}"
   fi
-  
+
   if [[ -f "${g_rman_cmd_file}" ]]; then
-    prn dbg "Removing ${g_rman_cmd_file}"
+    prn --type "${C_DBG}" --text "Removing ${g_rman_cmd_file}"
     rm "${g_rman_cmd_file}"
   fi
-  
+
   return 0
 }
 
@@ -770,12 +783,12 @@ cleanup() {
 #  none
 #-------------------------------------------------------------------------------
 getsyspwd() {
-  [[ ! -f "${PWDPHRASE_FILE}" ]] && prn fatal "Passphrase file ${PWDPHRASE_FILE} doesn't exists"
-  [[ -z ${sys_pwd_hash} ]]       && prn fatal "No SYS password for database ${g_db_name} found in ${CONFIG_FILE}"
-  
+  [[ ! -f "${PWDPHRASE_FILE}" ]] && prn --type "${C_FATAL}" --text "Passphrase file ${PWDPHRASE_FILE} doesn't exists"
+  [[ -z ${sys_pwd_hash} ]]       && prn --type "${C_FATAL}" --text "No SYS password for database ${g_db_name} found in ${CONFIG_FILE}"
+
   g_sys_pwd=$(echo "${sys_pwd_hash}" | openssl aes-256-cbc -a -d -salt -kfile "${PWDPHRASE_FILE}" 2>/dev/null)
-  [[ -z ${g_sys_pwd} ]] && prn fatal "Unable to decrypt SYS password"
-  
+  [[ -z ${g_sys_pwd} ]] && prn --type "${C_FATAL}" --text "Unable to decrypt SYS password"
+
   return 0
 }
 
@@ -791,13 +804,13 @@ main() {
   check_db_status
   check_db_role
   gen_rman_cmd
-  
-  prn "################################################################################"
-  prn "ORACLE_HOME   : ${ORACLE_HOME}"
-  prn "ORACLE_SID    : ${ORACLE_SID}"
-  prn "Backup type   : ${g_backup_type}"
-  prn "################################################################################"
-  
+
+  prn --text "################################################################################"
+  prn --text "ORACLE_HOME   : ${ORACLE_HOME}"
+  prn --text "ORACLE_SID    : ${ORACLE_SID}"
+  prn --text "Backup type   : ${g_backup_type}"
+  prn --text "################################################################################"
+
   force_logging enable
   exec_rman
   log_header
